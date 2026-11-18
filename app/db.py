@@ -49,6 +49,22 @@ CREATE TABLE IF NOT EXISTS restricted_dates (
     task_id TEXT NOT NULL,
     PRIMARY KEY (date, task_id)
 );
+
+-- report reconciliation credentials. A voucher is issued only when the
+-- submitted per-page click counts match every active part file of the day,
+-- and is permanently bound to the exact set of active files at issue time.
+CREATE TABLE IF NOT EXISTS reconciliation_vouchers (
+    voucher_id        TEXT PRIMARY KEY,
+    date              TEXT NOT NULL,
+    file_ids          TEXT NOT NULL,   -- newline-joined, sorted snapshot of active files
+    expected_counts   TEXT NOT NULL,   -- JSON: {page: expected clicks}
+    actual_counts     TEXT NOT NULL,   -- JSON: {page: measured clicks} at issue time
+    status            TEXT NOT NULL CHECK (status IN ('valid', 'invalidated')),
+    invalidated_reason TEXT,
+    created_at        TEXT NOT NULL,
+    invalidated_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_vouchers_date ON reconciliation_vouchers(date, status);
 """
 
 
@@ -114,6 +130,14 @@ class StateStore:
                 "INSERT OR IGNORE INTO user_dates(user_id, date) VALUES (?,?)",
                 [(u, date) for u in user_ids],
             )
+            # any new click landing in the lake changes the day's file set:
+            # every voucher previously issued for that day is immediately dead
+            conn.execute(
+                "UPDATE reconciliation_vouchers SET status='invalidated',"
+                " invalidated_reason='new_upload', invalidated_at=?"
+                " WHERE date=? AND status='valid'",
+                (now, date),
+            )
 
     def get_file(self, file_id: str) -> Optional[sqlite3.Row]:
         return self.query_one("SELECT * FROM files WHERE file_id=?", (file_id,))
@@ -168,6 +192,15 @@ class StateStore:
                 "INSERT OR IGNORE INTO restricted_dates(date, task_id)"
                 " SELECT date, ? FROM user_dates WHERE user_id=?",
                 (task_id, user_id),
+            )
+            # accepting an erasure for this user freezes every day it touches:
+            # outstanding report vouchers for those days can no longer be used
+            conn.execute(
+                "UPDATE reconciliation_vouchers SET status='invalidated',"
+                " invalidated_reason='erasure_accepted', invalidated_at=?"
+                " WHERE status='valid' AND date IN"
+                "       (SELECT date FROM user_dates WHERE user_id=?)",
+                (now, user_id),
             )
 
     def get_task(self, task_id: str) -> Optional[sqlite3.Row]:
@@ -307,3 +340,42 @@ class StateStore:
                 " WHERE task_id=?",
                 (now, task_id),
             )
+
+    # ------------------------------------------------------------ vouchers
+
+    def invalidate_vouchers_for_date(self, date: str, reason: str) -> None:
+        """Retire every still-valid voucher of one day. Used when a fresh
+        reconciliation checklist is submitted: the old voucher must stop
+        working even if the new checklist does not match."""
+        now = utcnow()
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE reconciliation_vouchers SET status='invalidated',"
+                " invalidated_reason=?, invalidated_at=?"
+                " WHERE date=? AND status='valid'",
+                (reason, now, date),
+            )
+
+    def issue_voucher(self, voucher_id: str, date: str, file_ids: list[str],
+                      expected_counts: str, actual_counts: str) -> None:
+        now = utcnow()
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO reconciliation_vouchers(voucher_id, date, file_ids,"
+                " expected_counts, actual_counts, status, created_at)"
+                " VALUES (?,?,?,?,?,'valid',?)",
+                (
+                    voucher_id,
+                    date,
+                    "\n".join(file_ids),
+                    expected_counts,
+                    actual_counts,
+                    now,
+                ),
+            )
+
+    def get_voucher(self, voucher_id: str) -> Optional[sqlite3.Row]:
+        return self.query_one(
+            "SELECT * FROM reconciliation_vouchers WHERE voucher_id=?",
+            (voucher_id,),
+        )

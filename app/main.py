@@ -13,8 +13,14 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from .config import Config
-from .core import ErasureService, NoDataError, RestrictedError
-from .schemas import ErasureRequest
+from .core import (
+    ErasureService,
+    NoDataError,
+    ReconcileMismatchError,
+    RestrictedError,
+    VoucherInvalidError,
+)
+from .schemas import ErasureRequest, ReconciliationRequest
 from .storage import SCHEMA
 
 log = logging.getLogger("erasure.api")
@@ -169,6 +175,78 @@ def create_app(config: Config | None = None) -> FastAPI:
             media_type="text/csv",
             headers={"Content-Disposition": f'attachment; filename="clicks-{date}.csv"'},
         )
+
+    # -------------------------------------------------- reconciliation / report
+
+    @app.post(
+        "/reconcile",
+        summary="Verify a report checklist and issue a raw-click download voucher",
+    )
+    def reconcile(req: ReconciliationRequest):
+        date = validate_date(req.date)
+        expected = dict(req.expected_counts)
+        try:
+            result = service.reconcile(date, expected)
+        except RestrictedError as exc:
+            raise HTTPException(409, str(exc))
+        except NoDataError as exc:
+            raise HTTPException(404, str(exc))
+        except ReconcileMismatchError as exc:
+            # no voucher is issued; any previous voucher for this day is already
+            # invalidated by the service, so it cannot be reused either
+            raise HTTPException(
+                409,
+                {
+                    "error": "count_mismatch",
+                    "date": date,
+                    "expected": exc.expected,
+                    "actual": exc.actual,
+                },
+            )
+        return JSONResponse(result, status_code=201)
+
+    @app.get(
+        "/report/download",
+        summary="Download raw clicks with a reconciliation voucher",
+    )
+    def report_download(
+        voucher_id: str = Query(..., min_length=1),
+        format: str = Query("csv", pattern="^(csv|parquet)$"),
+    ):
+        try:
+            date, table = service.download_with_voucher(voucher_id)
+        except VoucherInvalidError as exc:
+            raise HTTPException(409, {"error": "voucher_invalid", "detail": exc.reason})
+        except RestrictedError as exc:
+            raise HTTPException(409, str(exc))
+        if format == "parquet":
+            buf = io.BytesIO()
+            pq.write_table(table, buf)
+            return Response(
+                buf.getvalue(),
+                media_type="application/octet-stream",
+                headers={
+                    "Content-Disposition": (
+                        f'attachment; filename="report-{date}-{voucher_id[:8]}.parquet"'
+                    )
+                },
+            )
+        return Response(
+            table_to_csv_bytes(table),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="report-{date}-{voucher_id[:8]}.csv"'
+                )
+            },
+        )
+
+    @app.get("/vouchers/{voucher_id}", summary="Inspect a reconciliation voucher")
+    def voucher_status(voucher_id: str):
+        status = service.voucher_status(voucher_id)
+        if status is None:
+            raise HTTPException(404, f"unknown voucher {voucher_id}")
+        return status
 
     # ------------------------------------------------------------- erasure
 

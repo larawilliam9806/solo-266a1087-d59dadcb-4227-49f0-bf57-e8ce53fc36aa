@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
@@ -31,6 +32,25 @@ class NoDataError(Exception):
     def __init__(self, date: str):
         self.date = date
         super().__init__(f"no data for date {date}")
+
+
+class ReconcileMismatchError(Exception):
+    """The submitted per-page checklist does not match the day's parquet data."""
+
+    def __init__(self, date: str, expected: dict, actual: dict):
+        self.date = date
+        self.expected = expected
+        self.actual = actual
+        super().__init__(f"reconciliation mismatch for {date}")
+
+
+class VoucherInvalidError(Exception):
+    """A download voucher is unknown, has been invalidated or its file set changed."""
+
+    def __init__(self, voucher_id: str, reason: str):
+        self.voucher_id = voucher_id
+        self.reason = reason
+        super().__init__(f"voucher {voucher_id} is not usable: {reason}")
 
 
 class ErasureService:
@@ -153,6 +173,140 @@ class ErasureService:
                 raise NoDataError(date)
             tables = [storage.read_table(self.config.data_dir, f["path"]) for f in files]
         return pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+
+    # ------------------------------------------------------ reconciliation
+
+    def reconcile(self, date: str, expected_counts: dict) -> dict:
+        """Verify a report checklist against the day's active parquet files and,
+        only when every per-page count matches and the day is not under an
+        erasure restriction, issue a download voucher bound to the exact set of
+        active files observed here.
+
+        Guarantees
+        ----------
+        * Runs under the same ``commit_lock`` as uploads and erasure
+          acceptance, so the observed active files form one complete file set:
+          no upload/erase can interleave with the count.
+        * Any previously valid voucher for the day is invalidated first, inside
+          a state transaction — even when the new checklist mismatches, the old
+          voucher can never be reused afterwards.
+        * A parquet read or DB registration failure propagates out before any
+          voucher row is written, so no usable credential can result.
+        """
+        with self.commit_lock:
+            # old credentials die before anything else is attempted
+            self.store.invalidate_vouchers_for_date(date, "reconciled_again")
+
+            if self.store.is_restricted(date):
+                raise RestrictedError(date)
+
+            lock = self.date_lock(date)
+            with lock:
+                files = self.store.active_files_for_date(date)
+                if not files:
+                    raise NoDataError(date)
+
+                # count clicks per page across the complete active file set
+                actual: dict[str, int] = {}
+                for info in files:
+                    pages = storage.read_table(
+                        self.config.data_dir, info["path"], columns=["page"]
+                    ).column("page").to_pylist()
+                    for page in pages:
+                        actual[page] = actual.get(page, 0) + 1
+
+                if actual != expected_counts:
+                    raise ReconcileMismatchError(date, expected_counts, actual)
+
+                voucher_id = new_file_id()
+                file_ids = [f["file_id"] for f in files]
+                # registration failure must leave no usable credential behind
+                self.store.issue_voucher(
+                    voucher_id,
+                    date,
+                    file_ids,
+                    json.dumps(expected_counts, sort_keys=True),
+                    json.dumps(actual, sort_keys=True),
+                )
+                log.info(
+                    "reconciliation for %s matched on %d file(s); voucher %s issued",
+                    date,
+                    len(file_ids),
+                    voucher_id,
+                )
+                return {
+                    "voucher_id": voucher_id,
+                    "date": date,
+                    "files": len(file_ids),
+                    "file_ids": file_ids,
+                    "expected_counts": expected_counts,
+                    "actual_counts": actual,
+                }
+
+    def download_with_voucher(self, voucher_id: str) -> tuple[str, pa.Table]:
+        """Download the raw clicks covered by a voucher.
+
+        The voucher pins one immutable set of part files. Only those files are
+        read, and the read of the whole pinned set finishes inside the date
+        lock before the response is produced, so an already-started download
+        always completes against its own file set even if an erasure rewrite
+        of the day begins immediately afterwards.
+        """
+        voucher = self.store.get_voucher(voucher_id)
+        if voucher is None:
+            raise VoucherInvalidError(voucher_id, "unknown voucher")
+        if voucher["status"] != "valid":
+            raise VoucherInvalidError(
+                voucher_id,
+                f"voucher invalidated ({voucher['invalidated_reason'] or 'unknown reason'})",
+            )
+        date = voucher["date"]
+        pinned_ids = voucher["file_ids"].split("\n") if voucher["file_ids"] else []
+
+        lock = self.date_lock(date)
+        with lock:
+            # re-check inside the lock: acceptance of an erasure may have
+            # invalidated the voucher while we were waiting for the lock
+            voucher = self.store.get_voucher(voucher_id)
+            if voucher is None or voucher["status"] != "valid":
+                raise VoucherInvalidError(voucher_id, "voucher no longer valid")
+            if self.store.is_restricted(date):
+                # defensive: acceptance invalidates vouchers anyway, but never
+                # serve a restricted day even if state disagrees
+                raise RestrictedError(date)
+
+            tables = []
+            for file_id in pinned_ids:
+                info = self.store.get_file(file_id)
+                if info is None or info["status"] != "active":
+                    # the pinned file set was rewritten/removed by an erasure:
+                    # the voucher can only correspond to a complete file set
+                    raise VoucherInvalidError(
+                        voucher_id, "pinned file set is no longer complete"
+                    )
+                tables.append(
+                    storage.read_table(self.config.data_dir, info["path"])
+                )
+        table = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+        return date, table
+
+    def voucher_status(self, voucher_id: str) -> Optional[dict]:
+        voucher = self.store.get_voucher(voucher_id)
+        if voucher is None:
+            return None
+        return {
+            "voucher_id": voucher["voucher_id"],
+            "date": voucher["date"],
+            "status": voucher["status"],
+            "file_ids": (
+                voucher["file_ids"].split("\n") if voucher["file_ids"] else []
+            ),
+            "expected_counts": json.loads(voucher["expected_counts"]),
+            "actual_counts": json.loads(voucher["actual_counts"]),
+            "invalidated_reason": voucher["invalidated_reason"],
+            "created_at": voucher["created_at"],
+            "invalidated_at": voucher["invalidated_at"],
+        }
 
     # -------------------------------------------------------------- erasure
 
