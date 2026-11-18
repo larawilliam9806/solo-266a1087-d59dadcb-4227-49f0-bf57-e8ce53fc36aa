@@ -1,0 +1,22 @@
+services:
+  api:
+    build: .
+    image: clicklake-erasure-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data/files
+      STATE_DIR: /data/state
+      ERASURE_RETRY_DELAY: "5"
+    volumes:
+      - clicklake-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  clicklake-data:
